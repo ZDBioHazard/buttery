@@ -1,0 +1,167 @@
+#!/bin/bash
+#
+# Buttery: A snapshot tool for Btrfs.
+#
+# For usage help, invoke the script with the '--help' or '-h' arguments.
+#
+# COPYRIGHT INFO
+#
+# By Ryan "ZDBioHazard" Turner <zdbiohazard2@gmail.com>
+# Copyright (c) 2015-2016
+#
+# LICENSE
+#
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or any later version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program. If not, see <http://www.gnu.org/licenses/>
+#
+
+# ----------------------------------------------------------------------------
+# Function definitions.
+# ----------------------------------------------------------------------------
+
+function show_help() {
+    echo "Usage: $(basename "${0}") [OPTIONS] SNAPDIR SUBVOLUME [SUBVOLUME ...]"
+    echo " OPTIONS:"
+    echo "  -h  --help               Show this help and exit."
+    echo "  -n  --dry-run            Only show commands that would run."
+    echo ""
+    echo " Positional Arguments:"
+    echo "  SNAPDIR      Where to locally store created backups."
+    echo "  SUBVOLUME    A list of subvolumes to snapshot."
+}
+
+function errmsg(){
+    echo -e "ERROR: ${@}" 1>&2
+}
+
+function short(){
+    # TODO - Maybe pull actual snapshot name from 'btrfs sub show'
+    [[ "${1}" == "/" ]] && echo "root" || echo "${1##*/}"
+}
+
+# ----------------------------------------------------------------------------
+# Pre-everything checks.
+# ----------------------------------------------------------------------------
+
+# Make sure the running user is root.
+if [[ "${EUID}" != "0" ]]; then
+    errmsg "This script must be run with root privileges.\n"
+    show_help
+    exit 1
+fi
+
+# Check that all needed commands are present.
+for COMMAND in 'btrfs' 'date' 'sed' 'touch'; do
+    which ${COMMAND} &> /dev/null
+    if [[ "${?}" != "0" ]]; then
+        errmsg "The '${COMMAND}' command is not available in \$PATH."
+        exit 3
+    fi
+done
+
+# ----------------------------------------------------------------------------
+# Configuration variables.
+# ----------------------------------------------------------------------------
+
+DRY_RUN=""
+SNAPDIR=""
+SUBVOLUMES=()
+
+# ----------------------------------------------------------------------------
+# Command line processing.
+# ----------------------------------------------------------------------------
+
+while [[ "${#}" -gt "0" ]]; do
+    case "${1}" in
+        -h|--help) show_help; exit 0 ;;
+        -n|--dry-run) DRY_RUN="echo >>>"; shift ;;
+
+        -*|--*)
+            errmsg "Unknown option '${1}'"
+            show_help
+            exit 1
+            ;;
+
+        *)
+            # Look for ${SNAPDIR} first.
+            if [[ -z "${SNAPDIR}" ]]; then
+                if [[ ! -d "${1}" ]]; then
+                    errmsg "SNAPDIR must be a directory.\n"
+                    show_help
+                    exit 2
+                fi
+                SNAPDIR="${1}"
+                shift
+                continue
+            fi
+
+            # Btrfs subvolumes should always be directories.
+            # Try that before asking Btrfs about it.
+            if [[ -d "${1}" ]]; then
+                btrfs subvolume show "${1}" &> /dev/null
+                if [[ "${?}" == "0" ]]; then
+                    SUBVOLUMES+=("${1}")
+                    shift
+                    continue
+                fi
+            fi
+
+            errmsg "SUBVOLUME '${1}' is not a Btrfs subvolume.\n"
+            show_help
+            exit 2
+            ;;
+    esac
+done
+
+# ----------------------------------------------------------------------------
+# Perform sanity checks on the configuration variables.
+# ----------------------------------------------------------------------------
+
+# Strip any forward slashes at the end of $SNAPDIR
+SNAPDIR="$(echo "${SNAPDIR}" | sed -e 's/\/*$//')"
+if [[ -z "${SNAPDIR}" ]]; then
+    errmsg "Must specify SNAPDIR.\n"
+    show_help
+    exit 2
+fi
+
+# ----------------------------------------------------------------------------
+# It's Star Trek time guys!
+# ----------------------------------------------------------------------------
+
+# This will be the timestamp we use for all these snapshots.
+DATE="$(date '+%Y-%m-%d_%H-%M-%S')"
+TODAY="${DATE%_*}"
+
+echo -e "\nSyncing filesystem"
+${DRY_RUN} btrfs filesystem sync "${SNAPDIR}"
+
+if [[ "${#SUBVOLUMES[@]}" != "0" ]]; then
+    echo -e "\nCreating snapshots"
+    for SUBVOLUME in "${SUBVOLUMES[@]}"; do
+        SNAPSHOT="${SNAPDIR}/$(short "${SUBVOLUME}")_${DATE}"
+        ${DRY_RUN} touch "${SUBVOLUME}" # Set the modification time to now.
+        ${DRY_RUN} btrfs subvolume snapshot -r "${SUBVOLUME}" "${SNAPSHOT}"
+        if [[ "${?}" != "0" ]]; then
+            errmsg "Creating snapshot of '${SUBVOLUME}' failed!"
+            exit 1
+        fi
+
+        # Manage the local 'latest' symlink.
+        LATEST="${SNAPDIR}/$(short "${SUBVOLUME}")_latest"
+        if [[ ! -e "${LATEST}" || -L "${LATEST}" ]]; then
+            ${DRY_RUN} ln -snf "${SNAPSHOT}" "${LATEST}"
+        fi
+    done
+fi
+
+exit 0
+# You've reached the end of the script. There's no more. Not even a newline.
