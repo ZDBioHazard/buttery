@@ -33,6 +33,10 @@ function show_help() {
     echo "  -h  --help               Show this help and exit."
     echo "  -n  --dry-run            Only show commands that would run."
     echo ""
+    echo "  -r  --remote='PATH'      Path to use as 'btrfs send' destination."
+    echo "  -c  --remote-cmd='PATH'  Path to the 'btrfs' command for 'btrfs receive'."
+    echo "                            (Default: 'btrfs') (See manual!)"
+    echo ""
     echo " Positional Arguments:"
     echo "  SNAPDIR      Where to locally store created backups."
     echo "  SUBVOLUME    A list of subvolumes to snapshot."
@@ -59,7 +63,7 @@ if [[ "${EUID}" != "0" ]]; then
 fi
 
 # Check that all needed commands are present.
-for COMMAND in 'btrfs' 'date' 'sed' 'touch'; do
+for COMMAND in 'btrfs' 'date' 'pv' 'sed' 'touch' 'tail' 'tr'; do
     which ${COMMAND} &> /dev/null
     if [[ "${?}" != "0" ]]; then
         errmsg "The '${COMMAND}' command is not available in \$PATH."
@@ -75,6 +79,9 @@ DRY_RUN=""
 SNAPDIR=""
 SUBVOLUMES=()
 
+REMOTE_SNAPDIR=""
+REMOTE_COMMAND=""
+
 # ----------------------------------------------------------------------------
 # Command line processing.
 # ----------------------------------------------------------------------------
@@ -83,6 +90,9 @@ while [[ "${#}" -gt "0" ]]; do
     case "${1}" in
         -h|--help) show_help; exit 0 ;;
         -n|--dry-run) DRY_RUN="echo >>>"; shift ;;
+
+        -r|--remote=*) REMOTE_SNAPDIR="${1#*=}"; shift ;;
+        -c|--remote-cmd=*) REMOTE_COMMAND="${1#*=}"; shift ;;
 
         -*|--*)
             errmsg "Unknown option '${1}'"
@@ -133,6 +143,12 @@ if [[ -z "${SNAPDIR}" ]]; then
     exit 2
 fi
 
+if [[ ! -z "${REMOTE_COMMAND}" && -z "${REMOTE_SNAPDIR}" ]]; then
+    errmsg "Must specify --remote-dir when using --remote-cmd\n"
+    show_help
+    exit 2
+fi
+
 # ----------------------------------------------------------------------------
 # It's Star Trek time guys!
 # ----------------------------------------------------------------------------
@@ -145,6 +161,11 @@ echo -e "\nSyncing filesystem"
 ${DRY_RUN} btrfs filesystem sync "${SNAPDIR}"
 
 if [[ "${#SUBVOLUMES[@]}" != "0" ]]; then
+
+    # ------------------------------------------------------------------------
+    # Create snapshots.
+    # ------------------------------------------------------------------------
+
     echo -e "\nCreating snapshots"
     for SUBVOLUME in "${SUBVOLUMES[@]}"; do
         SNAPSHOT="${SNAPDIR}/$(short "${SUBVOLUME}")_${DATE}"
@@ -161,6 +182,83 @@ if [[ "${#SUBVOLUMES[@]}" != "0" ]]; then
             ${DRY_RUN} ln -snf "${SNAPSHOT}" "${LATEST}"
         fi
     done
+
+    # ------------------------------------------------------------------------
+    # Send snapshots to remote location.
+    # ------------------------------------------------------------------------
+
+    if [[ ! -z "${REMOTE_SNAPDIR}" ]]; then
+        echo -e "\nSyncing filesystem"
+        ${DRY_RUN} btrfs filesystem sync "${SNAPDIR}"
+
+        echo -e "\nSending snapshots to the remote location"
+        for SUBVOLUME in "${SUBVOLUMES[@]}"; do
+            echo -e "\nSending ${SUBVOLUME}"
+            SNAPSHOT="${SNAPDIR}/$(short "${SUBVOLUME}")_${DATE}"
+            LATEST="${SNAPDIR}/$(short "${SUBVOLUME}")_latest_remote"
+
+            # Try to find the parent snapshot.
+            PARENT_SNAPSHOT=""
+            if [[ -L "${LATEST}" && -e "${LATEST}" ]]; then
+                PARENT_SNAPSHOT="$(readlink -f "${LATEST}")"
+            fi
+
+            if [[ "${DRY_RUN}" != "" ]]; then
+                if [[ "${PARENT_SNAPSHOT}" != "" ]]; then
+                    echo ">>> btrfs send -p \"${PARENT_SNAPSHOT}\" \"${SNAPSHOT}\" |" \
+                         "pv -trab | ${REMOTE_COMMAND} btrfs receive \"${REMOTE_SNAPDIR}\""
+                else
+                    echo ">>> btrfs send \"${SNAPSHOT}\" |" \
+                         "pv -trab | ${REMOTE_COMMAND} btrfs receive \"${REMOTE_SNAPDIR}\""
+                fi
+                SEND_RETCODES="0 0 0"
+            else
+                # If stdout and stderr are a terminal, then we can use pv's
+                # live output. If it's a pipe or a file or something, do some
+                # fancy trickery to only output the last line of pv, so we
+                # can still get the transfer size and speed in log files, etc.
+                if [[ -t 1 && -t 2 ]]; then
+                    if [[ "${PARENT_SNAPSHOT}" != "" ]]; then
+                        btrfs send -p "${PARENT_SNAPSHOT}" "${SNAPSHOT}" | \
+                            pv -trab | \
+                            ${REMOTE_COMMAND} btrfs receive "${REMOTE_SNAPDIR}"
+                    else
+                        btrfs send "${SNAPSHOT}" | pv -trab | \
+                            ${REMOTE_COMMAND} btrfs receive "${REMOTE_SNAPDIR}"
+                    fi
+                    SEND_RETCODES="${PIPESTATUS[@]}"
+                else
+                    # TODO - Explain how this works. It's pretty neat.
+                    SEND_RETCODES="$( {
+                        {
+                            if [[ "${PARENT_SNAPSHOT}" != "" ]]; then
+                                btrfs send -p "${PARENT_SNAPSHOT}" "${SNAPSHOT}" | \
+                                pv -tabf 2>&3 | \
+                                ${REMOTE_COMMAND} btrfs receive "${REMOTE_SNAPDIR}" 1>&2
+                            else
+                                btrfs send "${SNAPSHOT}" | pv -tabf 2>&3 | \
+                                ${REMOTE_COMMAND} btrfs receive "${REMOTE_SNAPDIR}" 1>&2
+                            fi
+
+                            echo "${PIPESTATUS[@]}" 1>&4
+                        } 3>&1 | tr '\r' '\n' | sed -e 's/^\s*//' -e '/^$/d' | tail -n1 1>&2
+                    } 4>&1 )"
+                fi
+            fi
+
+            # Make sure every command in the pipe exited cleanly.
+            if [[ "${SEND_RETCODES}" != "0 0 0" ]]; then
+                errmsg "Sending '${SNAPSHOT}' failed!"
+                errmsg "Exit codes were '${SEND_RETCODES}'"
+                continue # Rather than exit, try to send the other snapshots.
+            fi
+
+            # Manage the remote 'latest' symlink.
+            if [[ ! -e "${LATEST}" || -L "${LATEST}" ]]; then
+                ${DRY_RUN} ln -snf "${SNAPSHOT}" "${LATEST}"
+            fi
+        done
+    fi
 fi
 
 exit 0
