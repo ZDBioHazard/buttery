@@ -37,6 +37,14 @@ function show_help() {
     echo "  -c  --remote-cmd='PATH'  Path to the 'btrfs' command for 'btrfs receive'."
     echo "                            (Default: 'btrfs') (See manual!)"
     echo ""
+    echo "  -p  --purge              Purge old backups. (See manual!)"
+    echo "  -d  --daily='DAYS'       Keep daily backups until they are 'DAYS' days old."
+    echo "                            (Default: 7, implies '-p')"
+    echo "  -w  --weekly='DAYS'      Keep weekly backups until they are 'DAYS' days old."
+    echo "                            (Default: 31, implies '-p')"
+    echo "  -m  --monthly='DAYS'     Keep monthly backups until they are 'DAYS' days old."
+    echo "                            (Default: 365, implies '-p')"
+    echo ""
     echo " Positional Arguments:"
     echo "  SNAPDIR      Where to locally store created backups."
     echo "  SUBVOLUME    A list of subvolumes to snapshot."
@@ -44,6 +52,10 @@ function show_help() {
 
 function errmsg(){
     echo -e "ERROR: ${@}" 1>&2
+}
+
+function dbgmsg(){
+    [[ "${PURGE_DEBUG}" != "" ]] && echo -e "DEBUG: ${@}"
 }
 
 function short(){
@@ -63,7 +75,8 @@ if [[ "${EUID}" != "0" ]]; then
 fi
 
 # Check that all needed commands are present.
-for COMMAND in 'btrfs' 'date' 'pv' 'sed' 'touch' 'tail' 'tr'; do
+for COMMAND in 'btrfs' 'cut' 'date' 'grep' 'pv' \
+               'sed' 'sort' 'tail' 'touch' 'tr'; do
     which ${COMMAND} &> /dev/null
     if [[ "${?}" != "0" ]]; then
         errmsg "The '${COMMAND}' command is not available in \$PATH."
@@ -82,6 +95,12 @@ SUBVOLUMES=()
 REMOTE_SNAPDIR=""
 REMOTE_COMMAND=""
 
+PURGE_ENABLED=""
+PURGE_DAILY="7"
+PURGE_WEEKLY="31"
+PURGE_MONTHLY="365"
+PURGE_DEBUG=""
+
 # ----------------------------------------------------------------------------
 # Command line processing.
 # ----------------------------------------------------------------------------
@@ -93,6 +112,12 @@ while [[ "${#}" -gt "0" ]]; do
 
         -r|--remote=*) REMOTE_SNAPDIR="${1#*=}"; shift ;;
         -c|--remote-cmd=*) REMOTE_COMMAND="${1#*=}"; shift ;;
+
+        -p|--purge) PURGE_ENABLED="1"; shift ;;
+        -d|--daily=*) PURGE_ENABLED="1"; PURGE_DAILY="${1#*=}"; shift ;;
+        -w|--weekly=*) PURGE_ENABLED="1"; PURGE_WEEKLY="${1#*=}"; shift ;;
+        -m|--monthly=*) PURGE_ENABLED="1"; PURGE_MONTHLY="${1#*=}"; shift ;;
+        --purge-debug) PURGE_DEBUG="1"; shift ;;
 
         -*|--*)
             errmsg "Unknown option '${1}'"
@@ -143,10 +168,26 @@ if [[ -z "${SNAPDIR}" ]]; then
     exit 2
 fi
 
+if [[ "${PURGE_ENABLED}" == "" && "${#SUBVOLUMES[@]}" == "0" ]]; then
+    errmsg "Must specify at least one SUBVOLUME if not only purging.\n"
+    show_help
+    exit 2
+fi
+
 if [[ ! -z "${REMOTE_COMMAND}" && -z "${REMOTE_SNAPDIR}" ]]; then
     errmsg "Must specify --remote-dir when using --remote-cmd\n"
     show_help
     exit 2
+fi
+
+# Make sure the purge cutoff counts make sense.
+if [[ "${PURGE_DAILY}" == "0" || ( "${PURGE_WEEKLY}" != "0" && \
+      "${PURGE_DAILY}" -gt "${PURGE_WEEKLY}" ) ]]; then
+    PURGE_WEEKLY="${PURGE_DAILY}"
+fi
+if [[ "${PURGE_WEEKLY}" == "0" || ( "${PURGE_MONTHLY}" != "0" && \
+      "${PURGE_WEEKLY}" -gt "${PURGE_MONTHLY}" ) ]]; then
+    PURGE_MONTHLY="${PURGE_WEEKLY}"
 fi
 
 # ----------------------------------------------------------------------------
@@ -258,6 +299,103 @@ if [[ "${#SUBVOLUMES[@]}" != "0" ]]; then
                 ${DRY_RUN} ln -snf "${SNAPSHOT}" "${LATEST}"
             fi
         done
+    fi
+fi
+
+# ----------------------------------------------------------------------------
+# Purge old snapshots.
+# ----------------------------------------------------------------------------
+
+# # Bail out now if purging is disabled.
+if [[ "${PURGE_ENABLED}" != "" ]]; then
+    SNAP_DATEFORMAT="\([0-9]\{4\}\)\(-\([0-9]\)\{2\}\)\{2\}"
+    SNAP_TIMEFORMAT="\([0-9]\{2\}\)\(-\([0-9]\)\{2\}\)\{2\}"
+    SNAP_FORMAT="^[[:print:]]\+_${SNAP_DATEFORMAT}_${SNAP_TIMEFORMAT}$"
+    SNAP_LAST=""
+    LATEST_REMOTE=""
+    PURGE_LIST=()
+    declare -A MSEEN
+    declare -A WSEEN
+
+    echo -e "\nPurging old snapshots"
+    # This command chain should get a list of all the subvolumes
+    # in ${SNAPDIR} that match the backup name format,
+    # sorted by subvolume and date. The sort order is important
+    # to keep the subvolume date detector sane.
+    for SNAPSHOT in $(ls "${SNAPDIR}" | sed -e 's/\/$//' | \
+                      grep -e "${SNAP_FORMAT}" | sort -t_ -k 1,1 -k 2,3); do
+
+        # Make sure this item really is a Btrfs subvolume.
+        if [[ -d "${SNAPDIR}/${SNAPSHOT}" ]]; then
+            btrfs subvolume show "${SNAPDIR}/${SNAPSHOT}" &> /dev/null
+            if [[ "${?}" != "0" ]]; then
+                continue
+            fi
+        fi
+
+        SNAP_NAME="$(echo "${SNAPSHOT}" | rev | cut -d_ -f3- | rev | \
+                     sed -e "s|^${SNAPDIR}\/||")"
+        SNAP_DATE="$(echo "${SNAPSHOT}" | rev | cut -d_ -f2 | rev)"
+
+        # Convert the snapshot date to a year-month and year-week index.
+        MSLOT="$(date -d "${SNAP_DATE}" '+%Y-%m')"
+        WSLOT="$(date -d "${SNAP_DATE}" '+%Y-%V')"
+
+        # Reset our counters when a new base subvolume shows up.
+        if [[ "${SNAP_NAME}" != "${SNAP_LAST}" ]]; then
+            dbgmsg "New subvolume (${SNAP_NAME})"
+            LATEST_REMOTE="$(readlink -f "${SNAPDIR}/${SNAP_NAME}_latest_remote")"
+            unset MSEEN; declare -A MSEEN
+            unset WSEEN; declare -A WSEEN
+        fi
+        SNAP_LAST="${SNAP_NAME}"
+
+        # Don't purge the latest remote snapshot.
+        if [[ "${LATEST_REMOTE}" == "${SNAPSHOT}" ]]; then
+            dbgmsg "Keeping ${SNAP_NAME} ${SNAP_DATE} (latest remote)"
+            continue
+        fi
+
+        # If the snapshot is older than the monthly cutoff, purge it.
+        if [[ "${PURGE_MONTHLY}" != "0" && \
+              "$(date -d "${SNAP_DATE}" '+%s')" -le \
+              "$(date -d "${TODAY} - ${PURGE_MONTHLY} days" '+%s')" ]]; then
+            : # Do nothing here. Purge this old backup below.
+        # If the snapshot is older than the weekly cutoff, and
+        # we haven't seen a snapshot for that month, keep it.
+        elif [[ "${PURGE_WEEKLY}" != "0" && \
+                "$(date -d "${SNAP_DATE}" '+%s')" -le \
+                "$(date -d "${TODAY} - ${PURGE_WEEKLY} days" '+%s')" ]]; then
+            if [[ "${MSEEN["${MSLOT}"]}" != "1" ]]; then
+                dbgmsg "Keeping ${SNAP_NAME} ${SNAP_DATE} (monthly)"
+                MSEEN["${MSLOT}"]="1"
+                continue
+            fi
+        # If the snapshot is older than the daily cutoff, and
+        # we haven't seen a snapshot for that week, keep it.
+        elif [[ "${PURGE_DAILY}" != "0" && \
+                "$(date -d "${SNAP_DATE}" '+%s')" -le \
+                "$(date -d "${TODAY} - ${PURGE_DAILY} days" '+%s')" ]]; then
+            if [[ "${WSEEN["${WSLOT}"]}" != "1" ]]; then
+                dbgmsg "Keeping ${SNAP_NAME} ${SNAP_DATE} (weekly)"
+                WSEEN["${WSLOT}"]="1"
+                continue
+            fi
+        # If the snapshot is younger than the daily cutoff, keep it.
+        else
+            dbgmsg "Keeping ${SNAP_NAME} ${SNAP_DATE} (daily)"
+            continue
+        fi
+
+        dbgmsg "Purging ${SNAP_NAME} ${SNAP_DATE}"
+        PURGE_LIST+=("${SNAPDIR}/${SNAPSHOT}")
+    done
+
+    if [[ "${#PURGE_LIST[@]}" == "0" ]]; then
+        echo "There are no snapshots to be purged"
+    else
+        echo "Purging ${#PURGE_LIST[@]} snapshots"
+        ${DRY_RUN} btrfs subvolume delete --commit-each ${PURGE_LIST[@]}
     fi
 fi
 
