@@ -1,0 +1,134 @@
+BUTTERY(1)
+==========
+:doctype: manpage
+
+
+NAME
+----
+buttery - creates backups of Btrfs subvolumes and more
+
+
+SYNOPSIS
+--------
+*buttery* ['OPTIONS'] 'SNAPDIR' ['SUBVOLUME' ...]
+
+
+DESCRIPTION
+-----------
+*buttery* creates and manages backups of Btrfs filesystems by creating snapshots of subvolumes.
+
+It can use `'btrfs send'` to send the created backups to other Btrfs filesystems or remote servers, and can automatically rotate out old backups on a configurable schedule.
+
+
+OPTIONS
+-------
+=== GENERAL OPTIONS ===
+*-h*, *--help*::
+  Show this help and exit.
+
+*-n*, *--dry-run*::
+  Only show the commands that would run.
+
+=== REMOTE OPTIONS ===
+*-r*, *--remote*='PATH'::
+  Path to use as `'btrfs receive'` destination.
+
+*-c*, *--remote-command*='COMMAND'::
+  Path to the `'btrfs'` command for `'btrfs receive'`. +
+  (Default: `'btrfs'`, see the *<<EXAMPLES,Examples>>* section)
+
+=== PURGING OPTIONS ===
+*-p*, *--purge*::
+  Purge old backups. +
+  (See the *<<PURGE,Purging Backups>>* section)
+
+*-d*, *--daily*='DAYS'::
+  Keep daily backups until they are 'DAYS' days old. +
+  (Default: `7`, implies *-p*)
+
+*-w*, *--weekly*='DAYS'::
+  Keep weekly backups until they are 'DAYS' days old. +
+  (Default: `31`, implies *-p*)
+
+*-m*, *--monthly*='DAYS'::
+  Keep monthly backups until they are 'DAYS' days old. +
+  (Default: `365`, implies *-p*)
+
+
+POSITIONAL ARGUMENTS
+--------------------
+*SNAPDIR*::
+  Where *buttery* will store locally created backups.
+
+*SUBVOLUME*::
+  A list of subvolumes to back up.
+
+
+SNAPSHOT NAMING
+---------------
+Snapshot names will consist of the subvolume "basename" and the date/time.
+For example, `'/mnt/users'` would be `'users_YYYY-MM-DD_HH-MM-SS'`.
+
+`'/'` is a special case, and will be called `'root_YYYY-MM-DD_HH-MM-SS'`.
+
+A symlink to the most recent backup is maintained at `'SNAPDIR/NAME_latest'`.
+The most recent successful remote send is at `'SNAPDIR/NAME_latest_remote'`.
+
+CAUTION: Because of this naming scheme, beware of duplicate basenames.
+
+
+[[PURGE]]
+PURGING BACKUPS
+---------------
+*--daily*, *--weekly*, and *--monthly* control the cutoff age for daily, weekly, and monthly backups in days.
+`'0'` means unlimited.
+
+A backup must be at least *--daily* days old to be considered as a weekly backup, and must be at least *--weekly* days old to be considered as a monthly backup.
+
+Unlimited (`'0'`) overrides any further backup types, so if you specify unlimited weekly backups, you will have daily backups until *--daily* days and unlimited weekly backups with no monthly backups.
+
+If you want monthly backups without weekly backups, you can set *--weekly* to the same value as *--daily*.
+
+The default values of `7`/`31`/`365` will keep daily backups for a week, weekly backups for a month, and monthly backups for one year.
+
+CAUTION: Any Btrfs subvolumes in *SNAPDIR* that match the naming convention will be considered for purging.
+         This means if you remove a subvolume from your backup regiment, it's backups will eventually naturally expire.
+         Just to be safe, please only keep *buttery* managed backups in *SNAPDIR*.
+
+[[EXAMPLES]]
+EXAMPLES
+--------
+Say you have some Btrfs subvolumes set up for `'/'`, `'/home'`, and `'/mnt/media'`.
+To create a local backup in `'/mnt/snaps'`, you can simply call `'buttery'` with the backup directory and whatever subvolumes you want to back up.
+
+  # buttery /mnt/snaps / /home /mnt/media
+
+This command would create a structure like this in `'/mnt/snaps'`:
+
+  /mnt/backups/root_2017-01-01_00-00-00
+  /mnt/backups/root_latest  ->  root_2017-01-01_00-00-00
+  /mnt/backups/home_2017-01-01_00-00-00
+  /mnt/backups/home_latest  ->  home_2017-01-01_00-00-00
+  /mnt/backups/media_2017-01-01_00-00-00
+  /mnt/backups/media_latest  ->  media_2017-01-01_00-00-00
+
+To create local backups in `'/mnt/snaps'` and also `'btrfs send'` them to a Btrfs-formatted USB drive mounted on `'/mnt/usb'`:
+
+  # buttery --remote='/mnt/usb' /mnt/snaps / /home /mnt/media
+
+To create local backups in `'/mnt/snaps'` and also `'btrfs send'` them to `'/mnt/backups'` on a remote server via `'ssh'`:
+
+  # buttery --remote='/mnt/backups' \
+            --remote-command='ssh root@backups.example.com btrfs' \
+            /mnt/snaps / /home /mnt/media
+
+To delete local backups in `'/mnt/snaps'` which are older than six months without creating any new backups:
+
+  # buttery --daily=184 /mnt/snaps
+
+
+BUGS
+----
+Unfortunately, there are some limitations at the moment, mostly due to limited command access to remote servers.
+
+Check the bug tracker at https://github.com/ZDBioHazard/buttery/issues and please report any other issues you may have.
