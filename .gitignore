@@ -1,3 +1,14 @@
 buttery.1
 buttery.1.html
 docbook-xsl.css
+
+autom4te.cache/
+aclocal.m4
+config.log
+config.status
+configure
+install-sh
+Makefile.in
+Makefile
+missing
+*.tar*
