@@ -75,8 +75,8 @@ if [[ "${EUID}" != "0" ]]; then
 fi
 
 # Check that all needed commands are present.
-for COMMAND in 'btrfs' 'cut' 'date' 'grep' 'pv' \
-               'sed' 'sort' 'tail' 'touch' 'tr'; do
+for COMMAND in 'btrfs' 'cut' 'date' 'getopt' 'grep' \
+               'pv' 'sed' 'sort' 'tail' 'touch' 'tr'; do
     which ${COMMAND} &> /dev/null
     if [[ "${?}" != "0" ]]; then
         errmsg "The '${COMMAND}' command is not available in \$PATH."
@@ -105,55 +105,59 @@ PURGE_DEBUG=""
 # Command line processing.
 # ----------------------------------------------------------------------------
 
+if ! CMDLINE=$(getopt -o 'hnrcpdwm' --long 'help,dry-run,remote:,remote-cmd:,purge,daily:,weekly:,monthly:,purge-debug' -- "${@}"); then
+    show_help
+    exit 1
+fi
+eval set -- "${CMDLINE}"
+
+# Process options.
 while [[ "${#}" -gt "0" ]]; do
     case "${1}" in
         -h|--help) show_help; exit 0 ;;
         -n|--dry-run) DRY_RUN="echo >>>"; shift ;;
 
-        -r|--remote=*) REMOTE_SNAPDIR="${1#*=}"; shift ;;
-        -c|--remote-cmd=*) REMOTE_COMMAND="${1#*=}"; shift ;;
+        -r|--remote) REMOTE_SNAPDIR="${2}"; shift 2 ;;
+        -c|--remote-cmd) REMOTE_COMMAND="${2}"; shift 2 ;;
 
         -p|--purge) PURGE_ENABLED="1"; shift ;;
-        -d|--daily=*) PURGE_ENABLED="1"; PURGE_DAILY="${1#*=}"; shift ;;
-        -w|--weekly=*) PURGE_ENABLED="1"; PURGE_WEEKLY="${1#*=}"; shift ;;
-        -m|--monthly=*) PURGE_ENABLED="1"; PURGE_MONTHLY="${1#*=}"; shift ;;
+        -d|--daily) PURGE_ENABLED="1"; PURGE_DAILY="${2}"; shift 2 ;;
+        -w|--weekly) PURGE_ENABLED="1"; PURGE_WEEKLY="${2}"; shift 2 ;;
+        -m|--monthly) PURGE_ENABLED="1"; PURGE_MONTHLY="${2}"; shift 2 ;;
         --purge-debug) PURGE_DEBUG="1"; shift ;;
 
-        -*|--*)
-            errmsg "Unknown option '${1}'"
-            show_help
-            exit 1
-            ;;
+        --) shift; break ;;
+    esac
+done
 
-        *)
-            # Look for ${SNAPDIR} first.
-            if [[ -z "${SNAPDIR}" ]]; then
-                if [[ ! -d "${1}" ]]; then
-                    errmsg "SNAPDIR must be a directory.\n"
-                    show_help
-                    exit 2
-                fi
-                SNAPDIR="${1}"
-                shift
-                continue
-            fi
-
-            # Btrfs subvolumes should always be directories.
-            # Try that before asking Btrfs about it.
-            if [[ -d "${1}" ]]; then
-                btrfs subvolume show "${1}" &> /dev/null
-                if [[ "${?}" == "0" ]]; then
-                    SUBVOLUMES+=("${1}")
-                    shift
-                    continue
-                fi
-            fi
-
-            errmsg "SUBVOLUME '${1}' is not a Btrfs subvolume.\n"
+# Process positional arguments.
+while [[ "${#}" -gt "0" ]]; do
+    # Look for ${SNAPDIR} first.
+    if [[ -z "${SNAPDIR}" ]]; then
+        if [[ ! -d "${1}" ]]; then
+            errmsg "SNAPDIR must be a directory.\n"
             show_help
             exit 2
-            ;;
-    esac
+        fi
+        SNAPDIR="${1}"
+        shift
+        continue
+    fi
+
+    # Btrfs subvolumes should always be directories.
+    # Try that before asking Btrfs about it.
+    if [[ -d "${1}" ]]; then
+        btrfs subvolume show "${1}" &> /dev/null
+        if [[ "${?}" == "0" ]]; then
+            SUBVOLUMES+=("${1}")
+            shift
+            continue
+        fi
+    fi
+
+    errmsg "SUBVOLUME '${1}' is not a Btrfs subvolume.\n"
+    show_help
+    exit 2
 done
 
 # ----------------------------------------------------------------------------
