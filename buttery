@@ -51,6 +51,10 @@ function show_help() {
     echo "  SUBVOLUME    A list of subvolumes to snapshot."
 }
 
+function warnmsg(){
+    echo -e "WARN: ${@}" 1>&2
+}
+
 function errmsg(){
     echo -e "ERROR: ${@}" 1>&2
 }
@@ -64,16 +68,29 @@ function short(){
     [[ "${1}" == "/" ]] && echo "root" || echo "${1##*/}"
 }
 
+function check_subvol(){
+    # Btrfs subvolumes should always be directories.
+    # Try that before asking Btrfs about it.
+    if [[ ! -d "${1}" ]]; then
+        return 1
+    fi
+
+    # Skip checking subvolumes if not running as root.
+    if [[ "${EUID}" == "0" ]]; then
+        btrfs subvolume show "${1}" &> /dev/null
+        return "${?}"
+    else
+        if [[ "${WARNED_CHECK_SUBVOL}" == "" ]]; then
+            warnmsg "Not running as root, can't verify subvolumes."
+            WARNED_CHECK_SUBVOL="1"
+        fi
+        return 0
+    fi
+}
+
 # ----------------------------------------------------------------------------
 # Pre-everything checks.
 # ----------------------------------------------------------------------------
-
-# Make sure the running user is root.
-if [[ "${EUID}" != "0" ]]; then
-    errmsg "This script must be run with root privileges.\n"
-    show_help
-    exit 1
-fi
 
 # Check that all needed commands are present.
 for COMMAND in 'btrfs' 'cut' 'date' 'getopt' 'grep' \
@@ -147,15 +164,11 @@ while [[ "${#}" -gt "0" ]]; do
         continue
     fi
 
-    # Btrfs subvolumes should always be directories.
-    # Try that before asking Btrfs about it.
-    if [[ -d "${1}" ]]; then
-        btrfs subvolume show "${1}" &> /dev/null
-        if [[ "${?}" == "0" ]]; then
-            SUBVOLUMES+=("${1}")
-            shift
-            continue
-        fi
+    check_subvol "${1}"
+    if [[ "${?}" == "0" ]]; then
+        SUBVOLUMES+=("${1}")
+        shift
+        continue
     fi
 
     errmsg "SUBVOLUME '${1}' is not a Btrfs subvolume.\n"
@@ -166,6 +179,13 @@ done
 # ----------------------------------------------------------------------------
 # Perform sanity checks on the configuration variables.
 # ----------------------------------------------------------------------------
+
+# Make sure the running user is root.
+if [[ "${DRY_RUN}" == "" && "${EUID}" != "0" ]]; then
+    errmsg "This script must be run with root privileges. (Try --dry-run)\n"
+    show_help
+    exit 1
+fi
 
 # Strip any forward slashes at the end of $SNAPDIR
 SNAPDIR="$(echo "${SNAPDIR}" | sed -e 's/\/*$//')"
@@ -337,11 +357,9 @@ if [[ "${PURGE_ENABLED}" != "" ]]; then
                       grep -e "${SNAP_FORMAT}" | sort -t_ -k 1,1 -k 2,3); do
 
         # Make sure this item really is a Btrfs subvolume.
-        if [[ -d "${SNAPDIR}/${SNAPSHOT}" ]]; then
-            btrfs subvolume show "${SNAPDIR}/${SNAPSHOT}" &> /dev/null
-            if [[ "${?}" != "0" ]]; then
-                continue
-            fi
+        check_subvol "${SNAPDIR}/${SNAPSHOT}"
+        if [[ "${?}" != "0" ]]; then
+            continue
         fi
 
         SNAP_NAME="$(echo "${SNAPSHOT}" | rev | cut -d_ -f3- | rev | \
