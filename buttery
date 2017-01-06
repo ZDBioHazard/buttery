@@ -32,6 +32,7 @@ function show_help() {
     echo " OPTIONS:"
     echo "  -h  --help               Show this help and exit."
     echo "  -n  --dry-run            Only show commands that would run."
+    echo "  -s  --no-sync            Don't run 'btrfs fi sync' (May cause issues)"
     echo ""
     echo "  -r  --remote='PATH'      Path to use as 'btrfs send' destination."
     echo "  -c  --remote-cmd='PATH'  Path to the 'btrfs' command for 'btrfs receive'."
@@ -89,6 +90,7 @@ done
 # ----------------------------------------------------------------------------
 
 DRY_RUN=""
+NO_SYNC=""
 SNAPDIR=""
 SUBVOLUMES=()
 
@@ -105,7 +107,7 @@ PURGE_DEBUG=""
 # Command line processing.
 # ----------------------------------------------------------------------------
 
-if ! CMDLINE=$(getopt -o 'hnrcpdwm' --long 'help,dry-run,remote:,remote-cmd:,purge,daily:,weekly:,monthly:,purge-debug' -- "${@}"); then
+if ! CMDLINE=$(getopt -o 'hnsrcpdwm' --long 'help,dry-run,no-sync,remote:,remote-cmd:,purge,daily:,weekly:,monthly:,purge-debug' -- "${@}"); then
     show_help
     exit 1
 fi
@@ -116,6 +118,7 @@ while [[ "${#}" -gt "0" ]]; do
     case "${1}" in
         -h|--help) show_help; exit 0 ;;
         -n|--dry-run) DRY_RUN="echo >>>"; shift ;;
+        -s|--no-sync) NO_SYNC="1"; shift ;;
 
         -r|--remote) REMOTE_SNAPDIR="${2}"; shift 2 ;;
         -c|--remote-cmd) REMOTE_COMMAND="${2}"; shift 2 ;;
@@ -202,8 +205,10 @@ fi
 DATE="$(date '+%Y-%m-%d_%H-%M-%S')"
 TODAY="${DATE%_*}"
 
-echo -e "\nSyncing filesystem"
-${DRY_RUN} btrfs filesystem sync "${SNAPDIR}"
+if [[ "${NO_SYNC}" != "1" ]]; then
+    echo -e "\nSyncing filesystem"
+    ${DRY_RUN} btrfs filesystem sync "${SNAPDIR}"
+fi
 
 if [[ "${#SUBVOLUMES[@]}" != "0" ]]; then
 
@@ -233,8 +238,10 @@ if [[ "${#SUBVOLUMES[@]}" != "0" ]]; then
     # ------------------------------------------------------------------------
 
     if [[ ! -z "${REMOTE_SNAPDIR}" ]]; then
-        echo -e "\nSyncing filesystem"
-        ${DRY_RUN} btrfs filesystem sync "${SNAPDIR}"
+        if [[ "${NO_SYNC}" != "1" ]]; then
+            echo -e "\nSyncing filesystem"
+            ${DRY_RUN} btrfs filesystem sync "${SNAPDIR}"
+        fi
 
         echo -e "\nSending snapshots to the remote location"
         for SUBVOLUME in "${SUBVOLUMES[@]}"; do

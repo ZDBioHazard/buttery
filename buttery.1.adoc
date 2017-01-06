@@ -29,6 +29,9 @@ OPTIONS
 *-n*, *--dry-run*::
   Only show the commands that would run.
 
+*-s*, *--no-sync*::
+  Don't run `'btrfs filesystem sync'` (May cause issues)
+
 === REMOTE OPTIONS ===
 *-r*, *--remote*='PATH'::
   Path to use as `'btrfs receive'` destination.
