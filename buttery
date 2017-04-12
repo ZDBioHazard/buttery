@@ -343,6 +343,7 @@ if [[ "${PURGE_ENABLED}" != "" ]]; then
     SNAP_TIMEFORMAT="\([0-9]\{2\}\)\(-\([0-9]\)\{2\}\)\{2\}"
     SNAP_FORMAT="^[[:print:]]\+_${SNAP_DATEFORMAT}_${SNAP_TIMEFORMAT}$"
     SNAP_LAST=""
+    TODAY_STAMP="$(date -d "${TODAY}" '+%s')"
     LATEST_REMOTE=""
     PURGE_LIST=()
     declare -A MSEEN
@@ -365,6 +366,7 @@ if [[ "${PURGE_ENABLED}" != "" ]]; then
         SNAP_NAME="$(echo "${SNAPSHOT}" | rev | cut -d_ -f3- | rev | \
                      sed -e "s|^${SNAPDIR}\/||")"
         SNAP_DATE="$(echo "${SNAPSHOT}" | rev | cut -d_ -f2 | rev)"
+        SNAP_STAMP="$(date -d "${SNAP_DATE}" '+%s')"
 
         # Convert the snapshot date to a year-month and year-week index.
         MSLOT="$(date -d "${SNAP_DATE}" '+%Y-%m')"
@@ -387,14 +389,14 @@ if [[ "${PURGE_ENABLED}" != "" ]]; then
 
         # If the snapshot is older than the monthly cutoff, purge it.
         if [[ "${PURGE_MONTHLY}" != "0" && \
-              "$(date -d "${SNAP_DATE}" '+%s')" -le \
-              "$(date -d "${TODAY} - ${PURGE_MONTHLY} days" '+%s')" ]]; then
+              "${SNAP_STAMP}" -le \
+              "$((${TODAY_STAMP} - (86400 * ${PURGE_MONTHLY})))" ]]; then
             : # Do nothing here. Purge this old backup below.
         # If the snapshot is older than the weekly cutoff, and
         # we haven't seen a snapshot for that month, keep it.
         elif [[ "${PURGE_WEEKLY}" != "0" && \
-                "$(date -d "${SNAP_DATE}" '+%s')" -le \
-                "$(date -d "${TODAY} - ${PURGE_WEEKLY} days" '+%s')" ]]; then
+                "${SNAP_STAMP}" -le \
+                "$((${TODAY_STAMP} - (86400 * ${PURGE_WEEKLY})))" ]]; then
             if [[ "${MSEEN["${MSLOT}"]}" != "1" ]]; then
                 dbgmsg "Keeping ${SNAP_NAME} ${SNAP_DATE} (monthly)"
                 MSEEN["${MSLOT}"]="1"
@@ -403,8 +405,8 @@ if [[ "${PURGE_ENABLED}" != "" ]]; then
         # If the snapshot is older than the daily cutoff, and
         # we haven't seen a snapshot for that week, keep it.
         elif [[ "${PURGE_DAILY}" != "0" && \
-                "$(date -d "${SNAP_DATE}" '+%s')" -le \
-                "$(date -d "${TODAY} - ${PURGE_DAILY} days" '+%s')" ]]; then
+                "${SNAP_STAMP}" -le \
+                "$((${TODAY_STAMP} - (86400 * ${PURGE_DAILY})))" ]]; then
             if [[ "${WSEEN["${WSLOT}"]}" != "1" ]]; then
                 dbgmsg "Keeping ${SNAP_NAME} ${SNAP_DATE} (weekly)"
                 WSEEN["${WSLOT}"]="1"
