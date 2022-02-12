@@ -1,13 +1,9 @@
-#!/bin/bash
-#
-# Buttery: A snapshot tool for Btrfs.
-#
-# For usage help, invoke the script with the '--help' or '-h' arguments.
+#!/bin/sh
+# vim: set tabstop=4 shiftwidth=4 softtabstop=4 expandtab
 #
 # COPYRIGHT INFO
 #
-# By Ryan "ZDBioHazard" Turner <zdbiohazard2@gmail.com>
-# Copyright (c) 2015-2016
+# Copyright (c) 2015-2022 Ryan "ZDBioHazard" Turner <zdbiohazard2@gmail.com>
 #
 # LICENSE
 #
@@ -22,413 +18,357 @@
 # You should have received a copy of the GNU General Public License along
 # with this program. If not, see <http://www.gnu.org/licenses/>
 #
+set -o pipefail
 
 # ----------------------------------------------------------------------------
-# Function definitions.
+# Function definitions
 # ----------------------------------------------------------------------------
 
-function show_help() {
-    echo "Usage: $(basename "${0}") [OPTIONS] SNAPDIR SUBVOLUME [SUBVOLUME ...]"
-    echo " OPTIONS:"
-    echo "  -h  --help               Show this help and exit."
-    echo "  -n  --dry-run            Only show commands that would run."
-    echo "  -s  --no-sync            Don't run 'btrfs fi sync' (May cause issues)"
+show_help() {
+    echo "Usage: $(basename "${0}") [options] SNAPDIR [SUBVOLUME ...]"
+    echo " Options:"
+    echo "  --help                      Show this help and exit"
+    echo "  -n, --dry-run               Explain what would be done, without"
+    echo "                              actually doing anything"
+    echo "  -v, --verbose               Print more operation messages,"
+    echo "                              particularly about purge selection"
     echo ""
-    echo "  -r  --remote='PATH'      Path to use as 'btrfs send' destination."
-    echo "  -c  --remote-cmd='PATH'  Path to the 'btrfs' command for 'btrfs receive'."
-    echo "                            (Default: 'btrfs') (See manual!)"
+    echo "  -r, --remote=PATH           Path to use as the 'btrfs receive'"
+    echo "                              destination"
+    echo "  -c, --remote-cmd=COMMAND    Path to the 'btrfs' command for"
+    echo "                              'btrfs receive' (Default: 'btrfs')"
+    echo "  -N, --remote-name=NAME      Name of the remote connection"
+    echo "                              (Default: 'remote')"
     echo ""
-    echo "  -p  --purge              Purge old backups. (See manual!)"
-    echo "  -d  --daily='DAYS'       Keep daily backups until they are 'DAYS' days old."
-    echo "                            (Default: 7, implies '-p')"
-    echo "  -w  --weekly='DAYS'      Keep weekly backups until they are 'DAYS' days old."
-    echo "                            (Default: 31, implies '-p')"
-    echo "  -m  --monthly='DAYS'     Keep monthly backups until they are 'DAYS' days old."
-    echo "                            (Default: 365, implies '-p')"
+    echo "  -p, --purge[=NAME]          Purge old snapshots that match NAME."
+    echo "                              May be specified multiple times"
+    echo "  -h, --hourly=DAYS           Maximum age of hourly snapshots"
+    echo "                              (Default: 1, implies '--purge')"
+    echo "  -d, --daily=DAYS            Maximum age of daily snapshots"
+    echo "                              (Default: 14, implies '--purge')"
+    echo "  -w, --weekly=DAYS           Maximum age of weekly snapshots"
+    echo "                              (Default: 90, implies '--purge')"
+    echo "  -m, --monthly=DAYS          Maximum age of monthly snapshots"
+    echo "                              (Default: 365, implies '--purge')"
+    echo "  -y, --yearly=DAYS           Maximum age of annual snapshots"
+    echo "                              (Default: 730, implies '--purge')"
     echo ""
     echo " Positional Arguments:"
-    echo "  SNAPDIR      Where to locally store created backups."
-    echo "  SUBVOLUME    A list of subvolumes to snapshot."
+    echo "  SNAPDIR       Local snapshot location"
+    echo "  SUBVOLUME     Subvolume to snapshot"
 }
 
-function warnmsg(){
-    echo -e "WARN: ${@}" 1>&2
+# Create some nice message printing functions
+msg() { printf "${*}\n"; }
+vmsg() { [ ${BUTTERY_VERBOSE} -eq 1 ] && msg "${*}"; }
+warnmsg() { msg "${CBLD}${CYEL}WARNING:${CRES} ${*}"; }
+errmsg() { msg "${CBLD}${CRED}ERROR:${CRES} ${*}"; }
+die() { errmsg "${*}"; exit 1; }
+
+# From https://stackoverflow.com/a/61835747
+is_uint() { case "${1}" in ''|*[!0-9]*) return 1;; esac ; }
+
+timestamp() {
+    # This is super gross. Why can't GNU `date` support passing a
+    # custom `strptime()` format like other `date` implementations?
+    RDATE='\([0-9]\{4\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)'
+    RTIME='\([0-9]\{2\}\)\([0-9]\{2\}\)\([0-9]\{2\}\)'
+    RCONV='\1-\2-\3 \4:\5:\6'
+    # Bail out if the string isn't in the right format
+    echo "${@}" | grep "^${RDATE}-${RTIME}$" &> /dev/null || return 1
+    # Convert the date format into a timestamp
+    date -d "$(echo "${@}" | sed "s/^${RDATE}-${RTIME}$/${RCONV}/")" '+%s'
 }
 
-function errmsg(){
-    echo -e "ERROR: ${@}" 1>&2
+subvol_name() {
+    # FIXME - If your subvolume name contains a newline for some reason,
+    # it will be truncated. I have no idea how to parse that reliably
+    btrfs subvolume show "${@}" | head -n1 | sed 's|/|-|g' || \
+        # The `head` command is likely to return a pipe error, so ignore it
+        [ ${?} -eq 141 ] && return 0 || return ${?}
 }
 
-function dbgmsg(){
-    [[ "${PURGE_DEBUG}" != "" ]] && echo -e "DEBUG: ${@}"
-}
-
-function short(){
-    # TODO - Maybe pull actual snapshot name from 'btrfs sub show'
-    [[ "${1}" == "/" ]] && echo "root" || echo "${1##*/}"
-}
-
-function check_subvol(){
-    # Btrfs subvolumes should always be directories.
-    # Try that before asking Btrfs about it.
-    if [[ ! -d "${1}" ]]; then
-        return 1
-    fi
-
-    # Skip checking subvolumes if not running as root.
-    if [[ "${EUID}" == "0" ]]; then
-        btrfs subvolume show "${1}" &> /dev/null
-        return "${?}"
-    else
-        if [[ "${WARNED_CHECK_SUBVOL}" == "" ]]; then
-            warnmsg "Not running as root, can't verify subvolumes."
-            WARNED_CHECK_SUBVOL="1"
-        fi
-        return 0
-    fi
-}
-
-# ----------------------------------------------------------------------------
-# Pre-everything checks.
-# ----------------------------------------------------------------------------
-
-# Check that all needed commands are present.
-for COMMAND in 'btrfs' 'cut' 'date' 'getopt' 'grep' \
-               'pv' 'sed' 'sort' 'tail' 'touch' 'tr'; do
-    which ${COMMAND} &> /dev/null
-    if [[ "${?}" != "0" ]]; then
-        errmsg "The '${COMMAND}' command is not available in \$PATH."
-        exit 3
-    fi
-done
-
-# ----------------------------------------------------------------------------
-# Configuration variables.
-# ----------------------------------------------------------------------------
-
-DRY_RUN=""
-NO_SYNC=""
-SNAPDIR=""
-SUBVOLUMES=()
-
-REMOTE_SNAPDIR=""
-REMOTE_COMMAND=""
-
-PURGE_ENABLED=""
-PURGE_DAILY="7"
-PURGE_WEEKLY="31"
-PURGE_MONTHLY="365"
-PURGE_DEBUG=""
-
-# ----------------------------------------------------------------------------
-# Command line processing.
-# ----------------------------------------------------------------------------
-
-if ! CMDLINE=$(getopt -o 'hnsrcpdwm' --long 'help,dry-run,no-sync,remote:,remote-cmd:,purge,daily:,weekly:,monthly:,purge-debug' -- "${@}"); then
-    show_help
-    exit 1
+# Set up color codes for terminal output
+if [ -t 1 ] && [ -t 2 ]; then
+    CRED='\033[1;31m'
+    CGRN='\033[1;32m'
+    CYEL='\033[1;33m'
+    CBLU='\033[1;34m'
+    CPUR='\033[1;35m'
+    CBLD='\033[1m'
+    CRES='\033[0m'
+else
+    CRED=''
+    CGRN=''
+    CYEL=''
+    CBLU=''
+    CPUR=''
+    CBLD=''
+    CRES=''
 fi
-eval set -- "${CMDLINE}"
 
-# Process options.
-while [[ "${#}" -gt "0" ]]; do
+# ----------------------------------------------------------------------------
+# Parse command line
+# ----------------------------------------------------------------------------
+
+BUTTERY_DRY_RUN=0
+BUTTERY_VERBOSE=0
+BUTTERY_REMOTE=
+BUTTERY_REMOTE_CMD=btrfs
+BUTTERY_REMOTE_NAME=remote
+BUTTERY_PURGE=0
+BUTTERY_PURGE_NAMES=
+BUTTERY_PURGE_HOURLY=1
+BUTTERY_PURGE_DAILY=14
+BUTTERY_PURGE_WEEKLY=90
+BUTTERY_PURGE_MONTHLY=365
+BUTTERY_PURGE_YEARLY=730
+BUTTERY_SNAPDIR=
+
+while [ ${#} -gt 0 ]; do
     case "${1}" in
-        -h|--help) show_help; exit 0 ;;
-        -n|--dry-run) DRY_RUN="echo >>>"; shift ;;
-        -s|--no-sync) NO_SYNC="1"; shift ;;
+        --help) show_help; exit 0 ;;
+        -n|--dry-run) BUTTERY_DRY_RUN=1 ;;
+        -v|--verbose) BUTTERY_VERBOSE=1 ;;
 
-        -r|--remote) REMOTE_SNAPDIR="${2}"; shift 2 ;;
-        -c|--remote-cmd) REMOTE_COMMAND="${2}"; shift 2 ;;
+        -r=*|--remote=*) BUTTERY_REMOTE="${1#*=}" ;;
+        -c=*|--remote-cmd=*) BUTTERY_REMOTE_CMD="${1#*=}" ;;
+        -N=*|--remote-name=*) BUTTERY_REMOTE_NAME="${1#*=}" ;;
 
-        -p|--purge) PURGE_ENABLED="1"; shift ;;
-        -d|--daily) PURGE_ENABLED="1"; PURGE_DAILY="${2}"; shift 2 ;;
-        -w|--weekly) PURGE_ENABLED="1"; PURGE_WEEKLY="${2}"; shift 2 ;;
-        -m|--monthly) PURGE_ENABLED="1"; PURGE_MONTHLY="${2}"; shift 2 ;;
-        --purge-debug) PURGE_DEBUG="1"; shift ;;
+        -p|--purge) BUTTERY_PURGE=1 ;;
+        -p=*|--purge=*) BUTTERY_PURGE_NAMES="${BUTTERY_PURGE_NAMES}${1#*=}\n";
+                        BUTTERY_PURGE=1 ;;
+        -h=*|--hourly=*) BUTTERY_PURGE_HOURLY="${1#*=}"; BUTTERY_PURGE=1 ;;
+        -d=*|--daily=*) BUTTERY_PURGE_DAILY="${1#*=}"; BUTTERY_PURGE=1 ;;
+        -w=*|--weekly=*) BUTTERY_PURGE_WEEKLY="${1#*=}"; BUTTERY_PURGE=1 ;;
+        -m=*|--monthly=*) BUTTERY_PURGE_MONTHLY="${1#*=}"; BUTTERY_PURGE=1 ;;
+        -y=*|--yearly=*) BUTTERY_PURGE_YEARLY="${1#*=}"; BUTTERY_PURGE=1 ;;
 
-        --) shift; break ;;
+        --) shift; break ;; # All options after '--' are positional
+        -*) die "Unknown option '${1}' (see --help)" ;;
+        *) break ;; # Everything after the options are positional
     esac
+    shift # Move to the next argument
 done
 
-# Process positional arguments.
-while [[ "${#}" -gt "0" ]]; do
-    # Look for ${SNAPDIR} first.
-    if [[ -z "${SNAPDIR}" ]]; then
-        if [[ ! -d "${1}" ]]; then
-            errmsg "SNAPDIR must be a directory.\n"
-            show_help
-            exit 2
-        fi
-        SNAPDIR="${1}"
-        shift
-        continue
-    fi
+# Read the snapshot directory
+[ ${#} -eq 0 ] && die "'SNAPDIR' must be specified. (see --help)"
+BUTTERY_SNAPDIR="${1}"
+shift
 
-    check_subvol "${1}"
-    if [[ "${?}" == "0" ]]; then
-        SUBVOLUMES+=("${1}")
-        shift
-        continue
-    fi
+# Sanity checks
+is_uint "${BUTTERY_PURGE_HOURLY}" || die "'--hourly' must be an integer"
+is_uint "${BUTTERY_PURGE_DAILY}" || die "'--daily' must be an integer"
+is_uint "${BUTTERY_PURGE_WEEKLY}" || die "'--weekly' must be an integer"
+is_uint "${BUTTERY_PURGE_MONTHLY}" || die "'--monthly' must be an integer"
+is_uint "${BUTTERY_PURGE_YEARLY}" || die "'--yearly' must be an integer"
 
-    errmsg "SUBVOLUME '${1}' is not a Btrfs subvolume.\n"
-    show_help
-    exit 2
-done
+# Check for root privileges
+[ "$(id -u)" == "0" ] || \
+    die "This script must be run as root in order to interact with Btrfs"
+
+# If no subvolumes are given, and we're not purging, then nothing happens
+if [ ${#} -le 0 ] && [ ${BUTTERY_PURGE} -eq 0 ]; then
+    warnmsg "Nothing to be done"
+    exit 0
+fi
+
+# Check the shell
+vmsg "${CPUR}Shell:${CRES} '${SHELL}'"
+if [ ! "${SHELL##*/}" == "ash" ] && [ ! "${SHELL##*/}" == "bash" ]; then
+    warnmsg "Running in shell '${SHELL}'"
+    warnmsg "This script is only tested with GNU 'bash' and Busybox 'ash'"
+fi
+
+# This will be the time stamp we use for all these snapshots
+DATE_FORMAT='%Y%m%d-%H%M%S'
+BUTTERY_DATE="$(date "+${DATE_FORMAT}")"
+vmsg "${CPUR}Snapshot date:${CRES} '${BUTTERY_DATE}'"
+
+[ ${BUTTERY_DRY_RUN} -eq 1 ] && \
+    msg "${CYEL}The filesystem will not be modified (--dry-run)${CRES}"
 
 # ----------------------------------------------------------------------------
-# Perform sanity checks on the configuration variables.
+# Create snapshots
 # ----------------------------------------------------------------------------
 
-# Make sure the running user is root.
-if [[ "${DRY_RUN}" == "" && "${EUID}" != "0" ]]; then
-    errmsg "This script must be run with root privileges. (Try --dry-run)\n"
-    show_help
-    exit 1
-fi
+if [ ${#} -ge 1 ]; then
+    vmsg "${CGRN}>>>${CRES} Creating snapshots in '${BUTTERY_SNAPDIR}'"
+    [ ${BUTTERY_DRY_RUN} -eq 0 ] && \
+        btrfs -q filesystem sync "${BUTTERY_SNAPDIR}"
 
-# Strip any forward slashes at the end of $SNAPDIR
-SNAPDIR="$(echo "${SNAPDIR}" | sed -e 's/\/*$//')"
-if [[ -z "${SNAPDIR}" ]]; then
-    errmsg "Must specify SNAPDIR.\n"
-    show_help
-    exit 2
-fi
+    for SUBVOLUME in "${@}"; do
+        SUBNAME="$(subvol_name "${SUBVOLUME}")"
+        SNAPSHOT="${BUTTERY_SNAPDIR}/${SUBNAME}_${BUTTERY_DATE}"
+        LATEST="${BUTTERY_SNAPDIR}/${SUBNAME}_latest"
 
-if [[ "${PURGE_ENABLED}" == "" && "${#SUBVOLUMES[@]}" == "0" ]]; then
-    errmsg "Must specify at least one SUBVOLUME if not only purging.\n"
-    show_help
-    exit 2
-fi
-
-if [[ ! -z "${REMOTE_COMMAND}" && -z "${REMOTE_SNAPDIR}" ]]; then
-    errmsg "Must specify --remote-dir when using --remote-cmd\n"
-    show_help
-    exit 2
-fi
-
-# Make sure the purge cutoff counts make sense.
-if [[ "${PURGE_DAILY}" == "0" || ( "${PURGE_WEEKLY}" != "0" && \
-      "${PURGE_DAILY}" -gt "${PURGE_WEEKLY}" ) ]]; then
-    PURGE_WEEKLY="${PURGE_DAILY}"
-fi
-if [[ "${PURGE_WEEKLY}" == "0" || ( "${PURGE_MONTHLY}" != "0" && \
-      "${PURGE_WEEKLY}" -gt "${PURGE_MONTHLY}" ) ]]; then
-    PURGE_MONTHLY="${PURGE_WEEKLY}"
-fi
-
-# ----------------------------------------------------------------------------
-# It's Star Trek time guys!
-# ----------------------------------------------------------------------------
-
-# This will be the timestamp we use for all these snapshots.
-DATE="$(date '+%Y-%m-%d_%H-%M-%S')"
-TODAY="${DATE%_*}"
-
-if [[ "${NO_SYNC}" != "1" ]]; then
-    echo -e "\nSyncing filesystem"
-    ${DRY_RUN} btrfs filesystem sync "${SNAPDIR}"
-fi
-
-if [[ "${#SUBVOLUMES[@]}" != "0" ]]; then
-
-    # ------------------------------------------------------------------------
-    # Create snapshots.
-    # ------------------------------------------------------------------------
-
-    echo -e "\nCreating snapshots"
-    for SUBVOLUME in "${SUBVOLUMES[@]}"; do
-        SNAPSHOT="${SNAPDIR}/$(short "${SUBVOLUME}")_${DATE}"
-        ${DRY_RUN} touch "${SUBVOLUME}" # Set the modification time to now.
-        ${DRY_RUN} btrfs subvolume snapshot -r "${SUBVOLUME}" "${SNAPSHOT}"
-        if [[ "${?}" != "0" ]]; then
-            errmsg "Creating snapshot of '${SUBVOLUME}' failed!"
-            exit 1
+        if [ -z "${SUBNAME}" ]; then
+            warnmsg "'${SUBVOLUME}' is not a Btrfs subvolume"
+            continue
         fi
 
-        # Manage the local 'latest' symlink.
-        LATEST="${SNAPDIR}/$(short "${SUBVOLUME}")_latest"
-        if [[ ! -e "${LATEST}" || -L "${LATEST}" ]]; then
-            ${DRY_RUN} ln -snf "${SNAPSHOT}" "${LATEST}"
+        # Take the snapshot
+        msg "${CBLU}Snapshotting${CRES} '${SUBVOLUME}' as '${SUBNAME}'"
+        if [ ${BUTTERY_DRY_RUN} -eq 0 ]; then
+            touch -c "${SUBVOLUME}"
+
+            if ! btrfs -q subvolume snap -r "${SUBVOLUME}" "${SNAPSHOT}"; then
+                errmsg "Could not create a snapshot of '${SUBVOLUME}'"
+                continue
+            fi
+
+            # Update the "latest" symlink
+            vmsg "${CPUR}Updating symlink:${CRES} '${LATEST}'"
+            if ! ln -snfT "${SNAPSHOT}" "${LATEST}"; then
+                errmsg "Could not create a symlink at '${LATEST}'"
+                continue
+            fi
+        fi
+    done
+fi
+
+# ----------------------------------------------------------------------------
+# Part two - Send snapshots to remote location
+# ----------------------------------------------------------------------------
+
+if [ ${#} -ge 1 ] && [ ! -z "${BUTTERY_REMOTE}" ]; then
+    vmsg "${CGRN}>>>${CRES} Sending snapshots to '${BUTTERY_REMOTE}'"
+    [ ${BUTTERY_DRY_RUN} -eq 0 ] && \
+        btrfs -q filesystem sync "${BUTTERY_SNAPDIR}"
+
+    # Only rarely update the pv output if we're not running in a terminal
+    [ -t 1 ] && [ -t 2 ] && PV_INTERVAL=1 || PV_INTERVAL=3600
+
+    for SUBVOLUME in "${@}"; do
+        SUBNAME="$(subvol_name "${SUBVOLUME}")"
+        SNAPSHOT="${BUTTERY_SNAPDIR}/${SUBNAME}_${BUTTERY_DATE}"
+        LATEST="${BUTTERY_SNAPDIR}/${SUBNAME}_latest_${BUTTERY_REMOTE_NAME}"
+
+        # We should have already warned above, so don't warn again
+        [ -z "${SUBNAME}" ] && continue
+
+        # If the snapshot couldn't be created above, skip sending it
+        if ! subvol_name "${SNAPSHOT}" &> /dev/null; then
+            vmsg "${CPUR}Missing:${CRES} '${SNAPSHOT}'"
+            continue
+        fi
+
+        # Send the snapshot to the remote location
+        msg "${CBLU}Sending${CRES} '${SNAPSHOT}'"
+        if [ ${BUTTERY_DRY_RUN} -eq 0 ]; then
+            if ! { [ -L "${LATEST}" ] && \
+                   btrfs -q send -p "${LATEST}" "${SNAPSHOT}" || \
+                   btrfs -q send "${SNAPSHOT}"
+                 } | pv -btrW --interval ${PV_INTERVAL} | \
+                     ${BUTTERY_REMOTE_CMD} -q receive "${BUTTERY_REMOTE}"; then
+                errmsg "Could not send '${SNAPSHOT}'"
+                continue
+            fi
+
+            vmsg "${CPUR}Updating symlink:${CRES} '${LATEST}'"
+            if ! ln -snfT "${SNAPSHOT}" "${LATEST}"; then
+                errmsg "Could not create a symlink at '${LATEST}'"
+                continue
+            fi
+        fi
+    done
+fi
+
+# ----------------------------------------------------------------------------
+# Part three - Purge old snapshots
+# ----------------------------------------------------------------------------
+
+if [ ${BUTTERY_PURGE} -eq 1 ]; then
+    vmsg "${CGRN}>>>${CRES} Purging old snapshots"
+    [ ${BUTTERY_DRY_RUN} -eq 0 ] && \
+        btrfs -q filesystem sync "${BUTTERY_SNAPDIR}"
+
+    # Generate the cutoff times
+    TIMESTAMP=$(timestamp "${BUTTERY_DATE}")
+    CUTOFF_YEARLY=$((${TIMESTAMP} - (86400 * ${BUTTERY_PURGE_YEARLY})))
+    CUTOFF_MONTHLY=$((${TIMESTAMP} - (86400 * ${BUTTERY_PURGE_MONTHLY})))
+    CUTOFF_WEEKLY=$((${TIMESTAMP} - (86400 * ${BUTTERY_PURGE_WEEKLY})))
+    CUTOFF_DAILY=$((${TIMESTAMP} - (86400 * ${BUTTERY_PURGE_DAILY})))
+    CUTOFF_HOURLY=$((${TIMESTAMP} - (86400 * ${BUTTERY_PURGE_HOURLY})))
+
+    [ ${BUTTERY_PURGE_YEARLY} -eq 0 ] || \
+        vmsg "${CPUR}Yearly cutoff:${CRES} $(date -d "@${CUTOFF_YEARLY}")"
+    [ ${BUTTERY_PURGE_MONTHLY} -eq 0 ] || \
+        vmsg "${CPUR}Monthly cutoff:${CRES} $(date -d "@${CUTOFF_MONTHLY}")"
+    [ ${BUTTERY_PURGE_WEEKLY} -eq 0 ] || \
+        vmsg "${CPUR}Weekly cutoff:${CRES} $(date -d "@${CUTOFF_WEEKLY}")"
+    [ ${BUTTERY_PURGE_DAILY} -eq 0 ] || \
+        vmsg "${CPUR}Daily cutoff:${CRES} $(date -d "@${CUTOFF_DAILY}")"
+    [ ${BUTTERY_PURGE_HOURLY} -eq 0 ] || \
+        vmsg "${CPUR}Hourly cutoff:${CRES} $(date -d "@${CUTOFF_HOURLY}")"
+
+    # Generate the list of pinned snapshots
+    PINNED=
+    for SYMLINK in "${BUTTERY_SNAPDIR}"/*; do
+        [ -L "${SYMLINK}" ] || continue
+        PINNED="${PINNED}$(readlink -fn "${SYMLINK}")\n"
+    done
+    PINNED="$(printf "${PINNED}" | sort -u)"
+    [ -z "${PINNED}" ] || vmsg "${CPUR}Pinned snapshots:${CRES}" \
+        "\n$(printf "${PINNED}" | sed 's/^/  /')"
+
+    KEPT=
+    PURGED=0
+    for SNAPSHOT in "${BUTTERY_SNAPDIR}"/*; do
+        # Skip non-directories
+        [ -d "${SNAPSHOT}" ] || continue
+
+        # Skip things not in the purge names list
+        if [ ! -z "${BUTTERY_PURGE_NAMES}" ]; then
+            SNAPNAME="${SNAPSHOT%_*}"  # We can't do '%_*' and '##*/' together
+            printf "${BUTTERY_PURGE_NAMES}" | \
+                grep "^${SNAPNAME##*/}$" &> /dev/null || continue
+        fi
+
+        # Get the timestamp, and skip paths that don't match the date format
+        TIMESTAMP=$(timestamp "${SNAPSHOT#*_}" 2> /dev/null) || continue
+
+        # Skip directories that aren't Btrfs subvolumes
+        subvol_name "${SNAPSHOT}" &> /dev/null || continue
+
+        # Figure out whether to keep this snapshot or not
+        KEY=''
+        [ ${TIMESTAMP} -ge ${CUTOFF_YEARLY} ] && KEY='%Y'
+        [ ${TIMESTAMP} -ge ${CUTOFF_MONTHLY} ] && KEY='%Y%m'
+        [ ${TIMESTAMP} -ge ${CUTOFF_WEEKLY} ] && KEY='%Y%m%V'
+        [ ${TIMESTAMP} -ge ${CUTOFF_DAILY} ] && KEY='%Y%m%V%d'
+        [ ${TIMESTAMP} -ge ${CUTOFF_HOURLY} ] && KEY='%Y%m%V%d%H'
+        COMP="${SNAPSHOT%_*}_$(date -d "@${TIMESTAMP}" "+${KEY}")"
+        if [ ! -z "${KEY}" ] && [ "${KEPT}" != "${COMP}" ]; then
+            vmsg "${CBLU}Keeping${CRES} '${SNAPSHOT##*/}' for '${COMP##*_}'"
+            KEPT="${COMP}"
+            continue
+        fi
+
+        # Keep snapshots in the pinned list
+        if [ ! -z "${PINNED}" ] && printf "${PINNED}" | \
+                grep "^${SNAPSHOT}$" &> /dev/null; then
+            vmsg "${CPUR}Pinned${CRES} '${SNAPSHOT##*/}'"
+            continue
+        fi
+
+        # Delete this snapshot
+        msg "${CRED}Deleting${CRES} '${SNAPSHOT##*/}'"
+        if [ ${BUTTERY_DRY_RUN} -eq 0 ]; then
+            if ! btrfs -q subvolume delete "${SNAPSHOT}"; then
+                errmsg "Could not delete '${SNAPSHOT}'"
+                continue
+            fi
+            PURGED=1
         fi
     done
 
-    # ------------------------------------------------------------------------
-    # Send snapshots to remote location.
-    # ------------------------------------------------------------------------
-
-    if [[ ! -z "${REMOTE_SNAPDIR}" ]]; then
-        if [[ "${NO_SYNC}" != "1" ]]; then
-            echo -e "\nSyncing filesystem"
-            ${DRY_RUN} btrfs filesystem sync "${SNAPDIR}"
-        fi
-
-        echo -e "\nSending snapshots to the remote location"
-        for SUBVOLUME in "${SUBVOLUMES[@]}"; do
-            echo -e "\nSending ${SUBVOLUME}"
-            SNAPSHOT="${SNAPDIR}/$(short "${SUBVOLUME}")_${DATE}"
-            LATEST="${SNAPDIR}/$(short "${SUBVOLUME}")_latest_remote"
-
-            # Try to find the parent snapshot.
-            PARENT_SNAPSHOT=""
-            if [[ -L "${LATEST}" && -e "${LATEST}" ]]; then
-                PARENT_SNAPSHOT="$(readlink -f "${LATEST}")"
-            fi
-
-            if [[ "${DRY_RUN}" != "" ]]; then
-                if [[ "${PARENT_SNAPSHOT}" != "" ]]; then
-                    echo ">>> btrfs send -p \"${PARENT_SNAPSHOT}\" \"${SNAPSHOT}\" |" \
-                         "pv -trab | ${REMOTE_COMMAND} btrfs receive \"${REMOTE_SNAPDIR}\""
-                else
-                    echo ">>> btrfs send \"${SNAPSHOT}\" |" \
-                         "pv -trab | ${REMOTE_COMMAND} btrfs receive \"${REMOTE_SNAPDIR}\""
-                fi
-                SEND_RETCODES="0 0 0"
-            else
-                # If stdout and stderr are a terminal, then we can use pv's
-                # live output. If it's a pipe or a file or something, do some
-                # fancy trickery to only output the last line of pv, so we
-                # can still get the transfer size and speed in log files, etc.
-                if [[ -t 1 && -t 2 ]]; then
-                    if [[ "${PARENT_SNAPSHOT}" != "" ]]; then
-                        btrfs send -p "${PARENT_SNAPSHOT}" "${SNAPSHOT}" | \
-                            pv -trab | \
-                            ${REMOTE_COMMAND} btrfs receive "${REMOTE_SNAPDIR}"
-                    else
-                        btrfs send "${SNAPSHOT}" | pv -trab | \
-                            ${REMOTE_COMMAND} btrfs receive "${REMOTE_SNAPDIR}"
-                    fi
-                    SEND_RETCODES="${PIPESTATUS[@]}"
-                else
-                    # TODO - Explain how this works. It's pretty neat.
-                    SEND_RETCODES="$( {
-                        {
-                            if [[ "${PARENT_SNAPSHOT}" != "" ]]; then
-                                btrfs send -p "${PARENT_SNAPSHOT}" "${SNAPSHOT}" | \
-                                pv -tabf 2>&3 | \
-                                ${REMOTE_COMMAND} btrfs receive "${REMOTE_SNAPDIR}" 1>&2
-                            else
-                                btrfs send "${SNAPSHOT}" | pv -tabf 2>&3 | \
-                                ${REMOTE_COMMAND} btrfs receive "${REMOTE_SNAPDIR}" 1>&2
-                            fi
-
-                            echo "${PIPESTATUS[@]}" 1>&4
-                        } 3>&1 | tr '\r' '\n' | sed -e 's/^\s*//' -e '/^$/d' | tail -n1 1>&2
-                    } 4>&1 )"
-                fi
-            fi
-
-            # Make sure every command in the pipe exited cleanly.
-            if [[ "${SEND_RETCODES}" != "0 0 0" ]]; then
-                errmsg "Sending '${SNAPSHOT}' failed!"
-                errmsg "Exit codes were '${SEND_RETCODES}'"
-                continue # Rather than exit, try to send the other snapshots.
-            fi
-
-            # Manage the remote 'latest' symlink.
-            if [[ ! -e "${LATEST}" || -L "${LATEST}" ]]; then
-                ${DRY_RUN} ln -snf "${SNAPSHOT}" "${LATEST}"
-            fi
-        done
+    # Wait until the Btrfs cleaner is done removing snapshots
+    if [ ${BUTTERY_DRY_RUN} -eq 0 ] && [ ${PURGED} -eq 1 ]; then
+        msg "${CYEL}Waiting for subvolume cleanup to finish${CRES}"
+        btrfs -q subvolume sync "${BUTTERY_SNAPDIR}" > /dev/null && \
+            btrfs -q filesystem sync "${BUTTERY_SNAPDIR}" && \
+                msg "${CGRN}Finished${CRES}" || \
+                msg "${CYEL}Finished (${?})${CRES}"
     fi
 fi
-
-# ----------------------------------------------------------------------------
-# Purge old snapshots.
-# ----------------------------------------------------------------------------
-
-# # Bail out now if purging is disabled.
-if [[ "${PURGE_ENABLED}" != "" ]]; then
-    SNAP_DATEFORMAT="\([0-9]\{4\}\)\(-\([0-9]\)\{2\}\)\{2\}"
-    SNAP_TIMEFORMAT="\([0-9]\{2\}\)\(-\([0-9]\)\{2\}\)\{2\}"
-    SNAP_FORMAT="^[[:print:]]\+_${SNAP_DATEFORMAT}_${SNAP_TIMEFORMAT}$"
-    SNAP_LAST=""
-    TODAY_STAMP="$(date -d "${TODAY}" '+%s')"
-    LATEST_REMOTE=""
-    PURGE_LIST=()
-    declare -A MSEEN
-    declare -A WSEEN
-
-    echo -e "\nPurging old snapshots"
-    # This command chain should get a list of all the subvolumes
-    # in ${SNAPDIR} that match the backup name format,
-    # sorted by subvolume and date. The sort order is important
-    # to keep the subvolume date detector sane.
-    for SNAPSHOT in $(ls "${SNAPDIR}" | sed -e 's/\/$//' | \
-                      grep -e "${SNAP_FORMAT}" | sort -t_ -k 1,1 -k 2,3); do
-
-        # Make sure this item really is a Btrfs subvolume.
-        check_subvol "${SNAPDIR}/${SNAPSHOT}"
-        if [[ "${?}" != "0" ]]; then
-            continue
-        fi
-
-        SNAP_NAME="$(echo "${SNAPSHOT}" | rev | cut -d_ -f3- | rev | \
-                     sed -e "s|^${SNAPDIR}\/||")"
-        SNAP_DATE="$(echo "${SNAPSHOT}" | rev | cut -d_ -f2 | rev)"
-        SNAP_STAMP="$(date -d "${SNAP_DATE}" '+%s')"
-
-        # Convert the snapshot date to a year-month and year-week index.
-        MSLOT="$(date -d "${SNAP_DATE}" '+%Y-%m')"
-        WSLOT="$(date -d "${SNAP_DATE}" '+%Y-%V')"
-
-        # Reset our counters when a new base subvolume shows up.
-        if [[ "${SNAP_NAME}" != "${SNAP_LAST}" ]]; then
-            dbgmsg "New subvolume (${SNAP_NAME})"
-            LATEST_REMOTE="$(readlink -f "${SNAPDIR}/${SNAP_NAME}_latest_remote")"
-            unset MSEEN; declare -A MSEEN
-            unset WSEEN; declare -A WSEEN
-        fi
-        SNAP_LAST="${SNAP_NAME}"
-
-        # Don't purge the latest remote snapshot.
-        if [[ "${LATEST_REMOTE}" == "${SNAPSHOT}" ]]; then
-            dbgmsg "Keeping ${SNAP_NAME} ${SNAP_DATE} (latest remote)"
-            continue
-        fi
-
-        # If the snapshot is older than the monthly cutoff, purge it.
-        if [[ "${PURGE_MONTHLY}" != "0" && \
-              "${SNAP_STAMP}" -le \
-              "$((${TODAY_STAMP} - (86400 * ${PURGE_MONTHLY})))" ]]; then
-            : # Do nothing here. Purge this old backup below.
-        # If the snapshot is older than the weekly cutoff, and
-        # we haven't seen a snapshot for that month, keep it.
-        elif [[ "${PURGE_WEEKLY}" != "0" && \
-                "${SNAP_STAMP}" -le \
-                "$((${TODAY_STAMP} - (86400 * ${PURGE_WEEKLY})))" ]]; then
-            if [[ "${MSEEN["${MSLOT}"]}" != "1" ]]; then
-                dbgmsg "Keeping ${SNAP_NAME} ${SNAP_DATE} (monthly)"
-                MSEEN["${MSLOT}"]="1"
-                continue
-            fi
-        # If the snapshot is older than the daily cutoff, and
-        # we haven't seen a snapshot for that week, keep it.
-        elif [[ "${PURGE_DAILY}" != "0" && \
-                "${SNAP_STAMP}" -le \
-                "$((${TODAY_STAMP} - (86400 * ${PURGE_DAILY})))" ]]; then
-            if [[ "${WSEEN["${WSLOT}"]}" != "1" ]]; then
-                dbgmsg "Keeping ${SNAP_NAME} ${SNAP_DATE} (weekly)"
-                WSEEN["${WSLOT}"]="1"
-                continue
-            fi
-        # If the snapshot is younger than the daily cutoff, keep it.
-        else
-            dbgmsg "Keeping ${SNAP_NAME} ${SNAP_DATE} (daily)"
-            continue
-        fi
-
-        dbgmsg "Purging ${SNAP_NAME} ${SNAP_DATE}"
-        PURGE_LIST+=("${SNAPDIR}/${SNAPSHOT}")
-    done
-
-    if [[ "${#PURGE_LIST[@]}" == "0" ]]; then
-        echo "There are no snapshots to be purged"
-    else
-        echo "Purging ${#PURGE_LIST[@]} snapshots"
-        ${DRY_RUN} btrfs subvolume delete --commit-each ${PURGE_LIST[@]}
-    fi
-fi
-
-exit 0
-# You've reached the end of the script. There's no more. Not even a newline.
