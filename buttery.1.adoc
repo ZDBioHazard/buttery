@@ -17,45 +17,57 @@ DESCRIPTION
 -----------
 *buttery* creates and manages backups of Btrfs filesystems by creating snapshots of subvolumes.
 
-It can use `'btrfs send'` to send the created backups to other Btrfs filesystems or remote servers, and can automatically rotate out old backups on a configurable schedule.
+It can use `'btrfs send'` to send the created backups to other Btrfs filesystems or remote servers, and can automatically thin out old backups.
 
 
 OPTIONS
 -------
 === GENERAL OPTIONS ===
-*-h*, *--help*::
-  Show this help and exit.
+*--help*::
+  Show this help and exit
 
 *-n*, *--dry-run*::
-  Only show the commands that would run.
+  Explain what would be done, without actually doing anything
 
-*-s*, *--no-sync*::
-  Don't run `'btrfs filesystem sync'` (May cause issues)
+*-v*, *--verbose*::
+  Print more operation messages, particularly about purge selection
 
 === REMOTE OPTIONS ===
 *-r*, *--remote*='PATH'::
-  Path to use as `'btrfs receive'` destination.
+  Path to use as `'btrfs receive'` destination
 
 *-c*, *--remote-command*='COMMAND'::
-  Path to the `'btrfs'` command for `'btrfs receive'`. +
+  Path to the `'btrfs'` command for `'btrfs receive'` +
   (Default: `'btrfs'`, see the *<<EXAMPLES,Examples>>* section)
 
+*-N*, *--remote-name*='NAME'::
+  Name of the remote connection, used to identify different remote locations +
+  (Default: `'remote'`, see the *<<EXAMPLES,Examples>>* section)
+
 === PURGING OPTIONS ===
-*-p*, *--purge*::
-  Purge old backups. +
+*-p*, *--purge*[='NAME']::
+  Purge old snapshots that match `'NAME'`. +
   (See the *<<PURGE,Purging Backups>>* section)
+
+*-h*, *--hourly*='DAYS'::
+  Keep hourly backups until they are 'DAYS' days old. +
+  (Default: `1`, implies *--purge*)
 
 *-d*, *--daily*='DAYS'::
   Keep daily backups until they are 'DAYS' days old. +
-  (Default: `7`, implies *-p*)
+  (Default: `14`, implies *--purge*)
 
 *-w*, *--weekly*='DAYS'::
   Keep weekly backups until they are 'DAYS' days old. +
-  (Default: `31`, implies *-p*)
+  (Default: `90`, implies *--purge*)
 
 *-m*, *--monthly*='DAYS'::
   Keep monthly backups until they are 'DAYS' days old. +
-  (Default: `365`, implies *-p*)
+  (Default: `365`, implies *--purge*)
+
+*-y*, *--yearly*='DAYS'::
+  Keep annual backups until they are 'DAYS' days old. +
+  (Default: `730`, implies *--purge*)
 
 
 POSITIONAL ARGUMENTS
@@ -69,65 +81,79 @@ POSITIONAL ARGUMENTS
 
 SNAPSHOT NAMING
 ---------------
-Snapshot names will consist of the subvolume "basename" and the date/time.
-For example, `'/mnt/users'` would be `'users_YYYY-MM-DD_HH-MM-SS'`.
-
-`'/'` is a special case, and will be called `'root_YYYY-MM-DD_HH-MM-SS'`.
+Snapshot names will consist of the subvolume "name" (from `'btrfs subvolume show'`), and the date/time.
+For example, `'/mnt/users'` might be `'users_YYYYmmdd-HHMMSS'`.
 
 A symlink to the most recent backup is maintained at `'SNAPDIR/NAME_latest'`.
-The most recent successful remote send is at `'SNAPDIR/NAME_latest_remote'`.
+The most recent successful remote send is at `'SNAPDIR/NAME_latest_REMOTENAME'`.
 
-CAUTION: Because of this naming scheme, beware of duplicate basenames.
+CAUTION: Beware of duplicate subvolume names.
 
 
 [[PURGE]]
 PURGING BACKUPS
 ---------------
-*--daily*, *--weekly*, and *--monthly* control the cutoff age for daily, weekly, and monthly backups in days.
-`'0'` means unlimited.
+When using *--purge*, the *--hourly*, *--daily*, *--weekly*, *--monthly*, and *--yearly* options control the cutoff age for backups in days.
+All purge-related options imply *--purge*.
 
-A backup must be at least *--daily* days old to be considered as a weekly backup, and must be at least *--weekly* days old to be considered as a monthly backup.
+If you do not want backups of a particular slot, set that cutoff to `'0'`.
 
-Unlimited (`'0'`) overrides any further backup types, so if you specify unlimited weekly backups, you will have daily backups until *--daily* days and unlimited weekly backups with no monthly backups.
+*--purge* can be used with an optional 'NAME' to only consider snapshots with that name for purging.
+*--purge='NAME'* can be specified multiple times to purge multiple selected names at once.
 
-If you want monthly backups without weekly backups, you can set *--weekly* to the same value as *--daily*.
+Snapshots with a `'*_latest*'` symlink pointing to them will not be removed.
 
-The default values of `7`/`31`/`365` will keep daily backups for a week, weekly backups for a month, and monthly backups for one year.
+Any snapshots in the backup directory matching the naming convention will be considered for purging.
+If you want to keep a particular backup forever, simply make sure there is a `'*_latest*'` symlink pointing to it.
 
-CAUTION: Any Btrfs subvolumes in *SNAPDIR* that match the naming convention will be considered for purging.
-         This means if you remove a subvolume from your backup regiment, it's backups will eventually naturally expire.
-         Just to be safe, please only keep *buttery* managed backups in *SNAPDIR*.
+To see which snapshots will be purged and why, run `'buttery'` with the `'--verbose --dry-run'` options.
 
 [[EXAMPLES]]
 EXAMPLES
 --------
-Say you have some Btrfs subvolumes set up for `'/'`, `'/home'`, and `'/mnt/media'`.
-To create a local backup in `'/mnt/snaps'`, you can simply call `'buttery'` with the backup directory and whatever subvolumes you want to back up.
+Say you have Btrfs subvolumes at `'/'` and `'/home'`, and you want to store backups in `'/mnt/backups'`:
 
-  # buttery /mnt/snaps / /home /mnt/media
+  # buttery /mnt/backups / /home
 
-This command would create a structure like this in `'/mnt/snaps'`:
+This will result in a set of snapshots and links like this:
 
-  /mnt/backups/root_2017-01-01_00-00-00
-  /mnt/backups/root_latest  ->  root_2017-01-01_00-00-00
-  /mnt/backups/home_2017-01-01_00-00-00
-  /mnt/backups/home_latest  ->  home_2017-01-01_00-00-00
-  /mnt/backups/media_2017-01-01_00-00-00
-  /mnt/backups/media_latest  ->  media_2017-01-01_00-00-00
+  /mnt/backups/root_20220102-124500
+  /mnt/backups/root_latest -> root_20220102-124500
+  /mnt/backups/home_20220102-124500
+  /mnt/backups/home_latest -> home_20220102-124500
 
-To create local backups in `'/mnt/snaps'` and also `'btrfs send'` them to a Btrfs-formatted USB drive mounted on `'/mnt/usb'`:
+The next time you run this command, it will create another set of backup snapshots and update the `'*_latest*'` symlinks accordingly.
 
-  # buttery --remote='/mnt/usb' /mnt/snaps / /home /mnt/media
+To create local backups in `'/mnt/backups'` and also `'btrfs send'` them to a Btrfs filesystem on `'/mnt/usb'`:
 
-To create local backups in `'/mnt/snaps'` and also `'btrfs send'` them to `'/mnt/backups'` on a remote server via `'ssh'`:
+  # buttery --remote=/mnt/usb /mnt/backups / /home
 
-  # buttery --remote='/mnt/backups' \
-            --remote-command='ssh root@backups.example.com btrfs' \
-            /mnt/snaps / /home /mnt/media
+To send backups to a remote server, use `'--remote-cmd'`:
 
-To delete local backups in `'/mnt/snaps'` which are older than six months without creating any new backups:
+  # buttery --remote-cmd='ssh root@backups.example.com btrfs' \
+            --remote=/mnt/backups /mnt/snaps / /home
 
-  # buttery --daily=184 /mnt/snaps
+When sending snapshots to a remote filesystem, `'$NAME_latest_$REMOTENAME'` symlinks will be created.
+
+When working with multiple remote filesystems, the *--remote-name* option can be used to differentiate between them.
+This helps keep the latest remote snapshots for multiple destinations pinned, so you can always do an incremental send.
+
+  # buttery --remote-name=blue --remote=/mnt/usb /mnt/backups / /home
+
+  /mnt/backups/home_20220102-124500
+  /mnt/backups/home_20220103-163030
+  /mnt/backups/home_latest -> home_20220103-163030
+  /mnt/backups/home_latest_red -> home_20220102-124500
+  /mnt/backups/home_latest_blue -> home_20220103-163030
+
+To thin out old backups in `'/mnt/backups'` without creating any new backups:
+
+  # buttery --purge /mnt/backups
+
+CAUTION: This can also be run on the remote filesystem to thin out your remote snapshots.
+However, without symlinks to pin snapshots on the remote filesystem, you can accidentally purge your common parent snapshot.
+I recommend symlinking your latest common snapshot on the remote filesystem to remedy this.
+Unfortunately, `'buttery'` cannot do this for you yet.
 
 
 BUGS
